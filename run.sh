@@ -1,13 +1,18 @@
 #!/bin/bash
 # run.sh - Andro-VPS runtime launcher. Self-contained.
-# - Xvfb without screensaver (display never goes black-from-idle)
-# - URL printed ASAP, then non-blocking wait for Android boot
-# - Auto wake + unlock + stay-on after boot to avoid black screen in browser
 
 set -uo pipefail
 
 INSTALL_DIR="$HOME/andro-vps"
 REPO_RAW="https://raw.githubusercontent.com/sureshkumar77536/andro-vps/main"
+
+# ───────────── Force a clean Android env (avoid stale values from VPS) ──────────────
+unset ANDROID_USER_HOME ANDROID_PREFS_ROOT ANDROID_AVD_HOME ANDROID_SDK_HOME
+export ANDROID_HOME="$HOME/android-sdk"
+export ANDROID_USER_HOME="$HOME/.android"
+export ANDROID_AVD_HOME="$HOME/.android/avd"
+export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools"
+mkdir -p "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME"
 
 # ───────────────────────────── inline UI helpers ─────────────────────────────
 if [ -t 1 ]; then
@@ -110,9 +115,6 @@ EOF
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
-export ANDROID_HOME="$HOME/android-sdk"
-export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools"
-
 CLOUDFLARED_LOG=/tmp/andro-vps-cloudflared.log
 NOVNC_LOG=/tmp/andro-vps-novnc.log
 EMU_LOG=/tmp/andro-vps-emulator.log
@@ -120,10 +122,9 @@ VNC_LOG=/tmp/andro-vps-x11vnc.log
 XVFB_LOG=/tmp/andro-vps-xvfb.log
 : > "$CLOUDFLARED_LOG" "$NOVNC_LOG" "$EMU_LOG" "$VNC_LOG" "$XVFB_LOG"
 
-# Wake helper — turns the screen on, dismisses lockscreen, keeps it on.
 adb_wake() {
-    adb shell input keyevent 224 >/dev/null 2>&1 || true   # KEYCODE_WAKEUP
-    adb shell input keyevent 82  >/dev/null 2>&1 || true   # KEYCODE_MENU (dismiss lock)
+    adb shell input keyevent 224 >/dev/null 2>&1 || true
+    adb shell input keyevent 82  >/dev/null 2>&1 || true
     adb shell svc power stayon true >/dev/null 2>&1 || true
 }
 
@@ -132,7 +133,7 @@ banner
 printf "  ${C_BOLD}Android VPS — Launch${C_RESET}\n"
 printf "  ${C_DIM}Logs: $ANDROVPS_LOG${C_RESET}\n\n"
 
-# Pre-flight
+# Pre-flight binaries
 missing=0
 for bin in Xvfb x11vnc tmux cloudflared adb emulator; do
     if ! command -v "$bin" >/dev/null 2>&1; then
@@ -145,6 +146,27 @@ if [ $missing -eq 1 ] || [ ! -d "$HOME/noVNC" ]; then
     printf "  ${C_YELLOW}⚠ Setup adhura hai. Pehle ye chala:${C_RESET}\n"
     printf "    ${C_BOLD}curl -sL %s/setup.sh | bash${C_RESET}\n\n" "$REPO_RAW"
     exit 1
+fi
+
+# Pre-flight AVD — recreate if missing or in a wrong-location stale spot
+AVD_INI="$ANDROID_USER_HOME/avd/myandroid.ini"
+if [ ! -f "$AVD_INI" ]; then
+    step_warn "AVD myandroid missing — re-creating"
+    rm -rf /home/runner/.config/.android/avd 2>/dev/null || true
+    rm -rf "$ANDROID_AVD_HOME/myandroid.avd" "$AVD_INI" 2>/dev/null || true
+    mkdir -p "$ANDROID_AVD_HOME"
+    step_run "AVD recreate" bash -c "
+        set -e
+        echo no | avdmanager create avd \\
+            -n myandroid \\
+            -k 'system-images;android-30;google_apis;x86_64' \\
+            --abi google_apis/x86_64 \\
+            -p '$ANDROID_AVD_HOME/myandroid.avd' \\
+            -f
+        test -f '$AVD_INI'
+    " || exit 1
+else
+    step_done "AVD myandroid found"
 fi
 
 if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
@@ -165,16 +187,16 @@ step_run "Cleanup purani sessions" bash -c '
     true
 '
 
-# Xvfb — screensaver/DPMS OFF so screen never goes black from idle
+# Xvfb — screensaver/DPMS OFF
 tmux new-session -d -s android_vps -n xvfb \
     "Xvfb :1 -screen 0 1080x1920x24 -dpms -s off -nolisten tcp >$XVFB_LOG 2>&1"
 spinner_until "DISPLAY=:1 xdpyinfo" "Xvfb ready" 15 || exit 1
 DISPLAY=:1 xset -dpms s off s noblank 2>/dev/null || true
 
-# Emulator (start, wait only for process — boot will be visible in VNC)
+# Emulator — pass the env explicitly to the tmux child so it sees ANDROID_AVD_HOME
 EMU_OPTS="-avd myandroid -no-audio -no-boot-anim -no-snapshot-save -gpu swiftshader_indirect -memory 3000 -skin 1080x1920"
 tmux new-window -t android_vps -n emulator \
-    "DISPLAY=:1 '$ANDROID_HOME/emulator/emulator' $EMU_OPTS >$EMU_LOG 2>&1"
+    "ANDROID_HOME='$ANDROID_HOME' ANDROID_USER_HOME='$ANDROID_USER_HOME' ANDROID_AVD_HOME='$ANDROID_AVD_HOME' DISPLAY=:1 '$ANDROID_HOME/emulator/emulator' $EMU_OPTS >$EMU_LOG 2>&1"
 spinner_until "pgrep -f 'qemu-system' >/dev/null" "Emulator started" 30 || {
     printf "  ${C_RED}Emulator start nahi hua${C_RESET}\n"
     tail -n 20 "$EMU_LOG" | sed "s/^/    ${C_DIM}│${C_RESET} /"
@@ -209,17 +231,16 @@ printf "${C_GREEN}${C_BOLD}  ╔════════════════
 printf "${C_GREEN}${C_BOLD}  ║   VNC LINK READY HAI! 🔗         ║${C_RESET}\n"
 printf "${C_GREEN}${C_BOLD}  ╚══════════════════════════════════╝${C_RESET}\n"
 echo
-printf "  ${C_BOLD}Browser me kholo (autoconnect on):${C_RESET}\n"
+printf "  ${C_BOLD}Browser me kholo:${C_RESET}\n"
 printf "  ${C_CYAN}${C_BOLD}%s${C_RESET}\n" "$VNC_LINK"
 echo
 printf "  ${C_BOLD}Plain URL:${C_RESET}\n"
 printf "  ${C_YELLOW}%s${C_RESET}\n" "$CF_URL"
 echo
-printf "  ${C_DIM}Android boot ho raha hai —${C_RESET}\n"
-printf "  ${C_DIM}boot complete hote hi auto unlock + screen-on hoga.${C_RESET}\n"
+printf "  ${C_DIM}Boot ke baad auto unlock + screen-on hoga${C_RESET}\n"
 echo
 
-# Wait for boot. Send wake commands periodically AND once at the end.
+# Boot wait — periodic wake + final wake
 boot_check='adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q 1'
 start=$SECONDS
 booted=0
@@ -234,7 +255,6 @@ while [ $(( SECONDS - start )) -lt 360 ]; do
     _clear_line
     printf "  ${C_CYAN}${frames[$i]}${C_RESET}  Android booting (%ss)" $(( SECONDS - start ))
     i=$(( (i + 1) % ${#frames[@]} ))
-    # Every ~10 seconds, try a wake just in case the lockscreen is keeping us black
     if [ $(( (SECONDS - start) % 10 )) -eq 0 ] && [ $(( SECONDS - start )) -gt 0 ]; then
         adb_wake
     fi
@@ -245,35 +265,33 @@ _clear_line
 
 if [ $booted -eq 1 ]; then
     printf "  ${C_GREEN}✔${C_RESET}  Android booted (%ss)\n" $(( SECONDS - start ))
-    # Final wake + unlock + stay-on, plus a couple of retries because sometimes
-    # the very first input event after boot is dropped.
     for _ in 1 2 3; do adb_wake; sleep 1; done
-    step_done "Screen wake + unlock + stay-on commands sent"
+    step_done "Wake + unlock + stay-on commands sent"
 else
     step_warn "Boot 6 min me detect nahi hua — fir bhi wake commands bhej diye"
     for _ in 1 2 3; do adb_wake; sleep 1; done
 fi
 
 echo
-printf "  ${C_BOLD}Browser tab REFRESH karo${C_RESET} — Android home screen dikhna chahiye.\n"
+printf "  ${C_BOLD}Browser tab REFRESH karo${C_RESET} — Android home dikhna chahiye.\n"
 echo
 printf "  ${C_DIM}Agar fir bhi black:${C_RESET}\n"
-printf "  ${C_DIM}  bash ~/andro-vps/wake.sh   # alag se wake bhejne ke liye${C_RESET}\n"
-printf "  ${C_DIM}  tmux attach -t android_vps # live logs${C_RESET}\n"
+printf "  ${C_DIM}  bash ~/andro-vps/wake.sh${C_RESET}\n"
+printf "  ${C_DIM}  tmux attach -t android_vps${C_RESET}\n"
 printf "  ${C_DIM}  tail -30 $EMU_LOG${C_RESET}\n"
 echo
 printf "  ${C_DIM}• Restart: bash ~/andro-vps/run.sh${C_RESET}\n"
 printf "  ${C_DIM}• Stop:    tmux kill-session -t android_vps${C_RESET}\n"
 echo
 
-# Helper script the user can run anytime to wake the screen.
 cat > "$INSTALL_DIR/wake.sh" <<'WAKE'
 #!/bin/bash
+unset ANDROID_USER_HOME ANDROID_PREFS_ROOT ANDROID_AVD_HOME ANDROID_SDK_HOME
 export PATH=$PATH:$HOME/android-sdk/platform-tools
 echo "Boot status: $(adb shell getprop sys.boot_completed 2>&1 | tr -d '\r')"
-adb shell input keyevent 224 >/dev/null 2>&1 || true   # WAKEUP
+adb shell input keyevent 224 >/dev/null 2>&1 || true
 sleep 1
-adb shell input keyevent 82  >/dev/null 2>&1 || true   # MENU (dismiss lock)
+adb shell input keyevent 82  >/dev/null 2>&1 || true
 adb shell svc power stayon true >/dev/null 2>&1 || true
 echo "Wake commands bhej diye. Browser refresh kar."
 WAKE
