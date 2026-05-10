@@ -1,11 +1,5 @@
 #!/bin/bash
 # setup.sh - Andro-VPS one-time setup. Self-contained, idempotent.
-#
-# Quick install:
-#   curl -sL https://raw.githubusercontent.com/sureshkumar77536/andro-vps/main/setup.sh | bash
-#
-# Re-run later:
-#   bash ~/andro-vps/run.sh
 
 set -uo pipefail
 
@@ -86,7 +80,6 @@ EOF
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Use sudo only when not already root and sudo is available.
 if [ "$(id -u)" = "0" ]; then
     SUDO=""
 elif command -v sudo >/dev/null 2>&1; then
@@ -108,8 +101,8 @@ step_run "Latest scripts download" bash -c "
     chmod +x '$INSTALL_DIR/run.sh' '$INSTALL_DIR/setup.sh'
 "
 
-# 1. APT packages — wait for any apt lock first, then install.
-APT_PKGS=(openjdk-17-jdk wget unzip curl git xvfb x11vnc libgl1-mesa-glx libpulse0 tmux python3 x11-utils iproute2 ca-certificates)
+# 1. APT packages
+APT_PKGS=(openjdk-17-jdk wget unzip curl git xvfb x11vnc libgl1 libpulse0 tmux python3 x11-utils iproute2 ca-certificates)
 need_apt=0
 for p in "${APT_PKGS[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || need_apt=1
