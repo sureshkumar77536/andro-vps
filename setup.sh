@@ -4,8 +4,8 @@ echo "============================================"
 echo "    ANDROID VPS SETUP STARTING..."
 echo "============================================"
 
-[span_0](start_span)sudo apt update && sudo apt upgrade -y[span_0](end_span)
-[span_1](start_span)sudo apt install -y openjdk-17-jdk wget unzip curl git xvfb x11vnc libgl1-mesa-glx libpulse0 tmux python3[span_1](end_span)
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y openjdk-17-jdk wget unzip curl git xvfb x11vnc libgl1-mesa-glx libpulse0 tmux python3
 
 mkdir -p ~/android-sdk/cmdline-tools
 cd ~/android-sdk/cmdline-tools
@@ -22,7 +22,7 @@ if ! grep -q "ANDROID_HOME" ~/.bashrc; then
   echo 'export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools' >> ~/.bashrc
 fi
 
-[span_2](start_span)yes | sdkmanager --licenses[span_2](end_span)
+yes | sdkmanager --licenses
 sdkmanager "platform-tools" "emulator" "system-images;android-30;google_apis;x86_64"
 echo "no" | avdmanager create avd -n myandroid -k "system-images;android-30;google_apis;x86_64" --device "pixel_4" -f
 
@@ -44,5 +44,4 @@ echo "============================================"
 echo " INSTALLATION COMPLETE! AUTOMATICALLY STARTING RUN.SH..."
 echo "============================================"
 
-# Yahan par run.sh apne aap chalu ho jayega bina user ke type kiye
 curl -sL https://raw.githubusercontent.com/sureshkumar77536/andro-vps/main/run.sh | bash
