@@ -1,8 +1,8 @@
 #!/bin/bash
 # run.sh - Andro-VPS runtime launcher. Self-contained.
-# Strategy: start everything in tmux windows, give the user the Cloudflare
-# URL ASAP so they can SEE the Android boot through VNC instead of waiting
-# blindly on a terminal spinner.
+# - Xvfb without screensaver (display never goes black-from-idle)
+# - URL printed ASAP, then non-blocking wait for Android boot
+# - Auto wake + unlock + stay-on after boot to avoid black screen in browser
 
 set -uo pipefail
 
@@ -24,8 +24,6 @@ ANDROVPS_LOG="${ANDROVPS_LOG:-/tmp/andro-vps.log}"
 _ui_restore_cursor() { tput cnorm 2>/dev/null || printf '\033[?25h'; }
 trap _ui_restore_cursor EXIT INT TERM
 _ui_hide_cursor() { tput civis 2>/dev/null || printf '\033[?25l'; }
-
-# Clear current visual line and reset cursor to column 0.
 _clear_line() { printf "\r\033[2K"; }
 
 spinner_pid() {
@@ -51,8 +49,6 @@ spinner_pid() {
     return $rc
 }
 
-# spinner_until '<bash test>' '<message>' [timeout_seconds]
-# Wall-clock timeout (uses $SECONDS), terminal-friendly redraw.
 spinner_until() {
     local check=$1 msg=$2 timeout=${3:-180}
     local frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
@@ -124,10 +120,17 @@ VNC_LOG=/tmp/andro-vps-x11vnc.log
 XVFB_LOG=/tmp/andro-vps-xvfb.log
 : > "$CLOUDFLARED_LOG" "$NOVNC_LOG" "$EMU_LOG" "$VNC_LOG" "$XVFB_LOG"
 
+# Wake helper — turns the screen on, dismisses lockscreen, keeps it on.
+adb_wake() {
+    adb shell input keyevent 224 >/dev/null 2>&1 || true   # KEYCODE_WAKEUP
+    adb shell input keyevent 82  >/dev/null 2>&1 || true   # KEYCODE_MENU (dismiss lock)
+    adb shell svc power stayon true >/dev/null 2>&1 || true
+}
+
 clear
 banner
 printf "  ${C_BOLD}Android VPS — Launch${C_RESET}\n"
-printf "  ${C_DIM}Logs: $ANDROVPS_LOG  •  tmux attach -t android_vps${C_RESET}\n\n"
+printf "  ${C_DIM}Logs: $ANDROVPS_LOG${C_RESET}\n\n"
 
 # Pre-flight
 missing=0
@@ -144,15 +147,13 @@ if [ $missing -eq 1 ] || [ ! -d "$HOME/noVNC" ]; then
     exit 1
 fi
 
-# KVM check (informational only)
 if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
-    step_done "KVM available (/dev/kvm)"
+    step_done "KVM available"
 else
-    step_warn "KVM not available — emulator will be slow (software emulation)"
+    step_warn "KVM nahi mila — emulator slow chalega"
 fi
 
-# 1. Cleanup
-step_run "Purani sessions cleanup" bash -c '
+step_run "Cleanup purani sessions" bash -c '
     tmux kill-session -t android_vps 2>/dev/null || true
     pkill -f "Xvfb :1"            2>/dev/null || true
     pkill -f "qemu-system"        2>/dev/null || true
@@ -164,37 +165,38 @@ step_run "Purani sessions cleanup" bash -c '
     true
 '
 
-# 2. Xvfb
+# Xvfb — screensaver/DPMS OFF so screen never goes black from idle
 tmux new-session -d -s android_vps -n xvfb \
-    "Xvfb :1 -screen 0 1080x1920x24 >$XVFB_LOG 2>&1"
+    "Xvfb :1 -screen 0 1080x1920x24 -dpms -s off -nolisten tcp >$XVFB_LOG 2>&1"
 spinner_until "DISPLAY=:1 xdpyinfo" "Xvfb ready" 15 || exit 1
+DISPLAY=:1 xset -dpms s off s noblank 2>/dev/null || true
 
-# 3. Emulator (start it but DON'T block on full Android boot)
+# Emulator (start, wait only for process — boot will be visible in VNC)
 EMU_OPTS="-avd myandroid -no-audio -no-boot-anim -no-snapshot-save -gpu swiftshader_indirect -memory 3000 -skin 1080x1920"
 tmux new-window -t android_vps -n emulator \
     "DISPLAY=:1 '$ANDROID_HOME/emulator/emulator' $EMU_OPTS >$EMU_LOG 2>&1"
-spinner_until "pgrep -f 'qemu-system' >/dev/null" "Emulator process started" 30 || {
-    printf "  ${C_RED}Emulator process start nahi hua.${C_RESET} Last log:\n"
+spinner_until "pgrep -f 'qemu-system' >/dev/null" "Emulator started" 30 || {
+    printf "  ${C_RED}Emulator start nahi hua${C_RESET}\n"
     tail -n 20 "$EMU_LOG" | sed "s/^/    ${C_DIM}│${C_RESET} /"
     exit 1
 }
 
-# 4. x11vnc (start NOW, even before Android boot — VNC will show boot animation)
+# x11vnc
 tmux new-window -t android_vps -n x11vnc \
     "x11vnc -display :1 -nopw -listen localhost -rfbport 5900 -xkb -forever -shared >$VNC_LOG 2>&1"
-spinner_until "ss -ltn 2>/dev/null | grep -q ':5900 '" "x11vnc up (5900)" 15 || exit 1
+spinner_until "ss -ltn 2>/dev/null | grep -q ':5900 '" "x11vnc up" 15 || exit 1
 
-# 5. noVNC
+# noVNC
 tmux new-window -t android_vps -n novnc \
     "$HOME/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 >$NOVNC_LOG 2>&1"
-spinner_until "ss -ltn 2>/dev/null | grep -q ':6080 '" "noVNC up (6080)" 15 || exit 1
+spinner_until "ss -ltn 2>/dev/null | grep -q ':6080 '" "noVNC up" 15 || exit 1
 
-# 6. Cloudflare tunnel
+# Cloudflare tunnel
 tmux new-window -t android_vps -n cloudflared \
     "cloudflared tunnel --url http://localhost:6080 --no-autoupdate >$CLOUDFLARED_LOG 2>&1"
 spinner_until "grep -Eo 'https://[a-zA-Z0-9.-]+\\.trycloudflare\\.com' '$CLOUDFLARED_LOG' | head -1" \
-    "Cloudflare URL wait" 90 || {
-    printf "  ${C_RED}✘${C_RESET}  Cloudflare URL nahi mila. Log: $CLOUDFLARED_LOG\n"
+    "Cloudflare URL" 90 || {
+    printf "  ${C_RED}✘${C_RESET}  Cloudflare URL nahi mila\n"
     tail -n 20 "$CLOUDFLARED_LOG" | sed "s/^/    ${C_DIM}│${C_RESET} /"
     exit 1
 }
@@ -203,31 +205,76 @@ CF_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CLOUDFLARED_LOG
 VNC_LINK="$CF_URL/vnc.html?autoconnect=true&resize=remote&reconnect=true"
 
 echo
-printf "${C_GREEN}${C_BOLD}  ╔══════════════════════════════════════════════════════════════╗${C_RESET}\n"
-printf "${C_GREEN}${C_BOLD}  ║                  VNC LINK READY HAI! 🔗                      ║${C_RESET}\n"
-printf "${C_GREEN}${C_BOLD}  ╚══════════════════════════════════════════════════════════════╝${C_RESET}\n"
+printf "${C_GREEN}${C_BOLD}  ╔══════════════════════════════════╗${C_RESET}\n"
+printf "${C_GREEN}${C_BOLD}  ║   VNC LINK READY HAI! 🔗         ║${C_RESET}\n"
+printf "${C_GREEN}${C_BOLD}  ╚══════════════════════════════════╝${C_RESET}\n"
 echo
 printf "  ${C_BOLD}Browser me kholo (autoconnect on):${C_RESET}\n"
-printf "     ${C_CYAN}${C_BOLD}%s${C_RESET}\n" "$VNC_LINK"
+printf "  ${C_CYAN}${C_BOLD}%s${C_RESET}\n" "$VNC_LINK"
 echo
-printf "  ${C_BOLD}Plain tunnel URL:${C_RESET}\n"
-printf "     ${C_YELLOW}%s${C_RESET}\n" "$CF_URL"
+printf "  ${C_BOLD}Plain URL:${C_RESET}\n"
+printf "  ${C_YELLOW}%s${C_RESET}\n" "$CF_URL"
 echo
-printf "  ${C_DIM}Android abhi boot ho raha hai — VNC me dekho. Bina KVM ke 3-5 min.${C_RESET}\n"
+printf "  ${C_DIM}Android boot ho raha hai —${C_RESET}\n"
+printf "  ${C_DIM}boot complete hote hi auto unlock + screen-on hoga.${C_RESET}\n"
 echo
 
-# 7. Background-style boot tracker (non-blocking — user already has the URL).
-# We poll briefly and print a final "boot complete" line, but if it takes
-# longer the user can already see the boot in their browser.
-step_info "Boot status check kar raha hu (background, max 5 min)..."
-spinner_until "adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' | grep -q 1" \
-    "Android booted" 300 || {
-    step_warn "Boot 5 min me detect nahi hua — VNC me dekho, agar locked screen dikh raha hai to boot ho gaya."
-}
+# Wait for boot. Send wake commands periodically AND once at the end.
+boot_check='adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" | grep -q 1'
+start=$SECONDS
+booted=0
+_ui_hide_cursor
+frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+i=0
+while [ $(( SECONDS - start )) -lt 360 ]; do
+    if eval "$boot_check"; then
+        booted=1
+        break
+    fi
+    _clear_line
+    printf "  ${C_CYAN}${frames[$i]}${C_RESET}  Android booting (%ss)" $(( SECONDS - start ))
+    i=$(( (i + 1) % ${#frames[@]} ))
+    # Every ~10 seconds, try a wake just in case the lockscreen is keeping us black
+    if [ $(( (SECONDS - start) % 10 )) -eq 0 ] && [ $(( SECONDS - start )) -gt 0 ]; then
+        adb_wake
+    fi
+    sleep 0.5
+done
+_ui_restore_cursor
+_clear_line
+
+if [ $booted -eq 1 ]; then
+    printf "  ${C_GREEN}✔${C_RESET}  Android booted (%ss)\n" $(( SECONDS - start ))
+    # Final wake + unlock + stay-on, plus a couple of retries because sometimes
+    # the very first input event after boot is dropped.
+    for _ in 1 2 3; do adb_wake; sleep 1; done
+    step_done "Screen wake + unlock + stay-on commands sent"
+else
+    step_warn "Boot 6 min me detect nahi hua — fir bhi wake commands bhej diye"
+    for _ in 1 2 3; do adb_wake; sleep 1; done
+fi
 
 echo
-printf "  ${C_DIM}• Live tmux:     tmux attach -t android_vps${C_RESET}\n"
-printf "  ${C_DIM}• Restart:       bash ~/andro-vps/run.sh${C_RESET}\n"
-printf "  ${C_DIM}• Stop:          tmux kill-session -t android_vps${C_RESET}\n"
-printf "  ${C_DIM}• Emulator log:  tail -f $EMU_LOG${C_RESET}\n"
+printf "  ${C_BOLD}Browser tab REFRESH karo${C_RESET} — Android home screen dikhna chahiye.\n"
 echo
+printf "  ${C_DIM}Agar fir bhi black:${C_RESET}\n"
+printf "  ${C_DIM}  bash ~/andro-vps/wake.sh   # alag se wake bhejne ke liye${C_RESET}\n"
+printf "  ${C_DIM}  tmux attach -t android_vps # live logs${C_RESET}\n"
+printf "  ${C_DIM}  tail -30 $EMU_LOG${C_RESET}\n"
+echo
+printf "  ${C_DIM}• Restart: bash ~/andro-vps/run.sh${C_RESET}\n"
+printf "  ${C_DIM}• Stop:    tmux kill-session -t android_vps${C_RESET}\n"
+echo
+
+# Helper script the user can run anytime to wake the screen.
+cat > "$INSTALL_DIR/wake.sh" <<'WAKE'
+#!/bin/bash
+export PATH=$PATH:$HOME/android-sdk/platform-tools
+echo "Boot status: $(adb shell getprop sys.boot_completed 2>&1 | tr -d '\r')"
+adb shell input keyevent 224 >/dev/null 2>&1 || true   # WAKEUP
+sleep 1
+adb shell input keyevent 82  >/dev/null 2>&1 || true   # MENU (dismiss lock)
+adb shell svc power stayon true >/dev/null 2>&1 || true
+echo "Wake commands bhej diye. Browser refresh kar."
+WAKE
+chmod +x "$INSTALL_DIR/wake.sh"
