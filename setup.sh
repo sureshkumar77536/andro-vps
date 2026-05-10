@@ -1,11 +1,26 @@
 #!/bin/bash
 # setup.sh - Andro-VPS one-time setup. Self-contained, idempotent.
+#
+# Quick install:
+#   curl -sL https://raw.githubusercontent.com/sureshkumar77536/andro-vps/main/setup.sh | bash
+# Re-run later:
+#   bash ~/andro-vps/run.sh
 
 set -uo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/sureshkumar77536/andro-vps/main"
 INSTALL_DIR="$HOME/andro-vps"
 mkdir -p "$INSTALL_DIR"
+
+# ───────────── Force a clean Android env (avoid stale values from VPS) ──────────────
+# These env vars (esp. ANDROID_USER_HOME / ANDROID_AVD_HOME) on some VPS images
+# (GitHub Actions runner / Azure boxes) point to /home/runner/... and silently
+# place the AVD outside $HOME, then `emulator` cannot find it.
+unset ANDROID_USER_HOME ANDROID_PREFS_ROOT ANDROID_AVD_HOME ANDROID_SDK_HOME
+export ANDROID_HOME="$HOME/android-sdk"
+export ANDROID_USER_HOME="$HOME/.android"
+export ANDROID_AVD_HOME="$HOME/.android/avd"
+mkdir -p "$ANDROID_USER_HOME" "$ANDROID_AVD_HOME"
 
 # ───────────────────────────── inline UI helpers ─────────────────────────────
 if [ -t 1 ]; then
@@ -29,17 +44,18 @@ spinner_pid() {
     local i=0
     _ui_hide_cursor
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${C_CYAN}${frames[$i]}${C_RESET}  %s" "$msg"
+        printf "\r\033[2K  ${C_CYAN}${frames[$i]}${C_RESET}  %s" "$msg"
         i=$(( (i + 1) % ${#frames[@]} ))
         sleep 0.1
     done
     local rc=0
     wait "$pid" || rc=$?
     _ui_restore_cursor
+    printf "\r\033[2K"
     if [ $rc -eq 0 ]; then
-        printf "\r  ${C_GREEN}✔${C_RESET}  %s\n" "$msg"
+        printf "  ${C_GREEN}✔${C_RESET}  %s\n" "$msg"
     else
-        printf "\r  ${C_RED}✘${C_RESET}  %s\n" "$msg"
+        printf "  ${C_RED}✘${C_RESET}  %s\n" "$msg"
     fi
     return $rc
 }
@@ -85,14 +101,14 @@ if [ "$(id -u)" = "0" ]; then
 elif command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 else
-    echo "ERROR: not root and sudo not installed. Install sudo or run as root." >&2
+    echo "ERROR: not root and sudo not installed." >&2
     exit 1
 fi
 
 clear
 banner
 printf "  ${C_BOLD}Android VPS — Setup${C_RESET}\n"
-printf "  ${C_DIM}One-time install. Subsequent runs use: bash ~/andro-vps/run.sh${C_RESET}\n"
+printf "  ${C_DIM}Re-run later: bash ~/andro-vps/run.sh${C_RESET}\n"
 printf "  ${C_DIM}Detailed log: $ANDROVPS_LOG${C_RESET}\n\n"
 
 step_run "Latest scripts download" bash -c "
@@ -108,7 +124,7 @@ for p in "${APT_PKGS[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || need_apt=1
 done
 if [ $need_apt -eq 1 ]; then
-    step_run "System packages install ho rahe hai" bash -c "
+    step_run "System packages install" bash -c "
         set -e
         for i in \$(seq 1 60); do
             if ! pgrep -x apt-get >/dev/null && ! pgrep -x dpkg >/dev/null && ! pgrep -x unattended-upgr >/dev/null; then
@@ -128,7 +144,6 @@ else
 fi
 
 # 2. Android SDK command-line tools
-ANDROID_HOME="$HOME/android-sdk"
 if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
     step_run "Android SDK command-line tools download" bash -c "
         set -e
@@ -144,33 +159,54 @@ else
     step_skip "Android SDK command-line tools already installed"
 fi
 
-export ANDROID_HOME
 export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools"
 
-if ! grep -q "ANDROID_HOME" "$HOME/.bashrc" 2>/dev/null; then
+# Persist correct env in .bashrc (also unset stale vars on every new shell).
+if ! grep -q "Andro-VPS env" "$HOME/.bashrc" 2>/dev/null; then
     {
         echo ''
-        echo '# Andro-VPS'
+        echo '# Andro-VPS env'
+        echo 'unset ANDROID_USER_HOME ANDROID_PREFS_ROOT ANDROID_AVD_HOME ANDROID_SDK_HOME'
         echo 'export ANDROID_HOME=$HOME/android-sdk'
+        echo 'export ANDROID_USER_HOME=$HOME/.android'
+        echo 'export ANDROID_AVD_HOME=$HOME/.android/avd'
         echo 'export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools'
     } >> "$HOME/.bashrc"
 fi
 
-# 3. SDK packages
+# 3. SDK packages — verify by file presence (system.img / system.img.qcow2)
 SDK_IMG_DIR="$ANDROID_HOME/system-images/android-30/google_apis/x86_64"
-if [ ! -d "$SDK_IMG_DIR" ] || [ ! -x "$ANDROID_HOME/emulator/emulator" ]; then
-    step_run "SDK licenses accept ho rahe hai" bash -c "yes | sdkmanager --licenses >/dev/null" || exit 1
+if [ ! -f "$SDK_IMG_DIR/system.img" ] && [ ! -f "$SDK_IMG_DIR/system.img.qcow2" ] || \
+   [ ! -x "$ANDROID_HOME/emulator/emulator" ]; then
+    step_run "SDK licenses accept" bash -c "yes | sdkmanager --licenses >/dev/null" || exit 1
     step_run "Platform-tools, emulator, system image install" bash -c "
         sdkmanager 'platform-tools' 'emulator' 'system-images;android-30;google_apis;x86_64' >/dev/null
+        # Verify the actual image landed
+        test -f '$SDK_IMG_DIR/system.img' || test -f '$SDK_IMG_DIR/system.img.qcow2'
     " || exit 1
 else
     step_skip "SDK packages already installed"
 fi
 
-# 4. AVD
-if ! "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" list avd 2>/dev/null | grep -q 'Name: myandroid'; then
+# 4. AVD — explicit -p path + --abi (mandatory in latest cmdline-tools).
+#    Verify by .ini file existence (avdmanager `list avd` lies if path is wrong).
+AVD_INI="$ANDROID_AVD_HOME/../myandroid.ini"
+AVD_INI="$ANDROID_USER_HOME/avd/myandroid.ini"
+if [ ! -f "$AVD_INI" ]; then
     step_run "AVD 'myandroid' bana raha hu" bash -c "
-        echo 'no' | avdmanager create avd -n myandroid -k 'system-images;android-30;google_apis;x86_64' --device 'pixel_4' -f >/dev/null
+        set -e
+        # Clean any stale wrong-location AVDs from previous runs.
+        rm -rf /home/runner/.config/.android/avd 2>/dev/null || true
+        rm -rf '$ANDROID_AVD_HOME/myandroid.avd' '$AVD_INI' 2>/dev/null || true
+        mkdir -p '$ANDROID_AVD_HOME'
+        echo no | avdmanager create avd \\
+            -n myandroid \\
+            -k 'system-images;android-30;google_apis;x86_64' \\
+            --abi google_apis/x86_64 \\
+            -p '$ANDROID_AVD_HOME/myandroid.avd' \\
+            -f
+        # Hard verification — fail if the .ini didn't actually appear.
+        test -f '$AVD_INI'
     " || exit 1
 else
     step_skip "AVD myandroid already exists"
