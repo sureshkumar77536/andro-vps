@@ -28,8 +28,6 @@ trap _ui_restore_cursor EXIT INT TERM
 _ui_hide_cursor() { tput civis 2>/dev/null || printf '\033[?25l'; }
 
 # spinner_pid <pid> <message>
-# Shows a spinner next to <message> until <pid> exits. Exit code of the
-# background process is preserved as the spinner's return value.
 spinner_pid() {
     local pid=$1 msg=$2
     local frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
@@ -51,8 +49,7 @@ spinner_pid() {
     return $rc
 }
 
-# spinner_until '<bash test command>' '<message>' [timeout_seconds]
-# Spins until the test command exits 0 or the timeout (default 180s) is hit.
+# spinner_until '<bash test>' '<message>' [timeout_sec]
 spinner_until() {
     local check=$1 msg=$2 timeout=${3:-180}
     local frames=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
@@ -75,25 +72,31 @@ spinner_until() {
 }
 
 # step_run '<message>' <command...>
-# Runs the command in the background, redirects all output to the log,
-# and shows a spinner.
+# Runs in background, redirects to log, shows spinner.
+# On failure: dumps the log lines that this step produced so the user
+# can see the actual error in the terminal.
 step_run() {
     local msg=$1; shift
+    local before
+    before=$(wc -l <"$ANDROVPS_LOG" 2>/dev/null || echo 0)
     ( "$@" ) >>"$ANDROVPS_LOG" 2>&1 &
     spinner_pid $! "$msg"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        local after
+        after=$(wc -l <"$ANDROVPS_LOG" 2>/dev/null || echo 0)
+        local n=$(( after - before ))
+        [ $n -lt 30 ] && n=30
+        printf "  ${C_DIM}── last %s log lines ──${C_RESET}\n" "$n"
+        tail -n "$n" "$ANDROVPS_LOG" 2>/dev/null | sed "s/^/    ${C_DIM}│${C_RESET} /"
+        printf "  ${C_DIM}── full log: $ANDROVPS_LOG ──${C_RESET}\n"
+    fi
+    return $rc
 }
 
-step_skip() {
-    printf "  ${C_YELLOW}⊙${C_RESET}  %s ${C_DIM}(already done)${C_RESET}\n" "$1"
-}
-
-step_done() {
-    printf "  ${C_GREEN}✔${C_RESET}  %s\n" "$1"
-}
-
-step_info() {
-    printf "  ${C_BLUE}ℹ${C_RESET}  %s\n" "$1"
-}
+step_skip() { printf "  ${C_YELLOW}⊙${C_RESET}  %s ${C_DIM}(already done)${C_RESET}\n" "$1"; }
+step_done() { printf "  ${C_GREEN}✔${C_RESET}  %s\n" "$1"; }
+step_info() { printf "  ${C_BLUE}ℹ${C_RESET}  %s\n" "$1"; }
 
 banner() {
     printf "${C_GREEN}${C_BOLD}"
